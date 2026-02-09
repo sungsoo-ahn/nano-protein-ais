@@ -1,7 +1,7 @@
 [project]
 name = "nano-protein-ais"
 version = "0.1.0"
-description = "Minimal, readable implementations of AlphaFold2, ESM2, RFDiffusion, and ProteinMPNN"
+description = "Minimal, readable implementations of AlphaFold3, RFDiffusion, and ProteinMPNN"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1.0",
@@ -14,6 +14,14 @@ dev = [
     "pytest>=7.4",
     "ruff>=0.1.0",
 ]
+viz = [
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "scikit-learn>=1.3",
+]
+pymol = [
+    "pymol-open-source>=3.0",
+]
 
 [tool.ruff]
 line-length = 100
@@ -23,7 +31,7 @@ target-version = "py310"
 select = ["E", "F", "I", "W"]
 
 [tool.setuptools]
-packages = ["esm2", "proteinmpnn", "alphafold2", "rfdiffusion"]
+packages = ["proteinmpnn", "alphafold3", "rfdiffusion"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

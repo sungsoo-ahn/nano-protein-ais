@@ -1,9 +1,9 @@
-"""Training script for AlphaFold2 structure prediction model.
+"""Training script for AlphaFold3 structure prediction model.
 
 Self-contained: includes PDB parser + dataset + training loop.
 
 Usage:
-    python -m alphafold2.train [--data_dir path/to/pdbs]
+    python -m alphafold3.train [--data_dir path/to/pdbs]
 """
 
 import argparse
@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from alphafold2.model import AlphaFold2
+from alphafold3.model import AlphaFold3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -24,13 +24,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 1
-LEARNING_RATE = 1e-3
-NUM_EPOCHS = 200
-WARMUP_STEPS = 100
+LEARNING_RATE = 3e-3
+NUM_EPOCHS = 1000
+WARMUP_STEPS = 10
 GRADIENT_CLIP = 1.0
 MAX_SEQ_LEN = 200
 SEED = 42
-LOG_EVERY = 10
+LOG_EVERY = 50
 
 # ---------------------------------------------------------------------------
 # PDB parser (inlined)
@@ -164,7 +164,7 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
 
 
-def train(data_dir: str, output_dir: str = "outputs/alphafold2") -> None:
+def train(data_dir: str, output_dir: str = "outputs/alphafold3") -> None:
     torch.manual_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -176,7 +176,7 @@ def train(data_dir: str, output_dir: str = "outputs/alphafold2") -> None:
         raise ValueError(f"No valid proteins in {data_dir}")
 
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    model = AlphaFold2().to(device)
+    model = AlphaFold3().to(device)
     logger.info(f"Parameters: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -208,7 +208,7 @@ def train(data_dir: str, output_dir: str = "outputs/alphafold2") -> None:
             if global_step % LOG_EVERY == 0:
                 logger.info(
                     f"step={global_step} epoch={epoch + 1} loss={loss.item():.4f} "
-                    f"fape={outputs['fape'].item():.4f}"
+                    f"diffusion_loss={outputs['diffusion_loss'].item():.4f}"
                 )
 
         if (epoch + 1) % 10 == 0:
@@ -222,6 +222,6 @@ def train(data_dir: str, output_dir: str = "outputs/alphafold2") -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="data/pdb")
-    parser.add_argument("--output_dir", default="outputs/alphafold2")
+    parser.add_argument("--output_dir", default="outputs/alphafold3")
     args = parser.parse_args()
     train(args.data_dir, args.output_dir)

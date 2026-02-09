@@ -1,10 +1,9 @@
 """Train a single protein AI model on a specified GPU, then evaluate.
 
 Usage:
-    python scripts/train_and_eval.py --model esm2 --gpu 0
-    python scripts/train_and_eval.py --model proteinmpnn --gpu 1
-    python scripts/train_and_eval.py --model alphafold2 --gpu 2
-    python scripts/train_and_eval.py --model rfdiffusion --gpu 3
+    python scripts/train_and_eval.py --model proteinmpnn --gpu 0
+    python scripts/train_and_eval.py --model alphafold2 --gpu 1
+    python scripts/train_and_eval.py --model rfdiffusion --gpu 2
 """
 
 import argparse
@@ -16,7 +15,7 @@ from pathlib import Path
 
 # Must set CUDA_VISIBLE_DEVICES before importing torch
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", required=True, choices=["esm2", "proteinmpnn", "alphafold2", "rfdiffusion"])
+parser.add_argument("--model", required=True, choices=["proteinmpnn", "alphafold3", "rfdiffusion"])
 parser.add_argument("--gpu", type=int, default=0)
 args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -41,113 +40,7 @@ sys.path.insert(0, str(ROOT))
 SEED = 42
 DATA_DIR = ROOT / "data"
 PDB_DIR = DATA_DIR / "pdb"
-FASTA_PATH = DATA_DIR / "sequences" / "uniref50_subset.fasta"
-
 AA_VOCAB = list("ACDEFGHIKLMNPQRSTVWY")
-
-
-# ===========================================================================
-# ESM2
-# ===========================================================================
-def train_esm2():
-    from esm2.model import ESM2, IDX_TO_AA, compute_mlm_loss, mask_tokens
-    from esm2.train import FASTADataset
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-
-    NUM_EPOCHS, BATCH_SIZE, LR, GRAD_CLIP, LOG_EVERY = 3, 32, 4e-4, 1.0, 50
-    WARMUP_STEPS = 500
-
-    dataset = FASTADataset(FASTA_PATH)
-    logger.info(f"Dataset: {len(dataset)} sequences")
-    dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True
-    )
-
-    model = ESM2().to(device)
-    logger.info(f"Parameters: {model.count_parameters():,}")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-    num_steps = len(dataloader) * NUM_EPOCHS
-
-    def lr_lambda(step):
-        if step < WARMUP_STEPS:
-            return step / max(1, WARMUP_STEPS)
-        progress = (step - WARMUP_STEPS) / max(1, num_steps - WARMUP_STEPS)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    global_step = 0
-    for epoch in range(1, NUM_EPOCHS + 1):
-        model.train()
-        for batch in dataloader:
-            tokens = batch["tokens"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            masked_tokens, labels = mask_tokens(tokens)
-            outputs = model(masked_tokens, attention_mask)
-            loss, metrics = compute_mlm_loss(outputs["logits"], labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
-            scheduler.step()
-
-            global_step += 1
-            if global_step % LOG_EVERY == 0:
-                logger.info(
-                    f"step={global_step} epoch={epoch} loss={loss.item():.4f} "
-                    f"acc={metrics['masked_accuracy']:.3f} ppl={metrics['perplexity']:.1f} "
-                    f"lr={scheduler.get_last_lr()[0]:.2e}"
-                )
-
-    ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
-    torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
-    logger.info(f"Saved checkpoint to {ckpt_path}")
-
-    # --- Evaluation ---
-    logger.info("=" * 60)
-    logger.info("EVALUATION: Masked Language Modeling")
-    logger.info("=" * 60)
-    model.eval()
-
-    # Take 5 sequences from the dataset
-    for i in range(min(5, len(dataset))):
-        sample = dataset[i]
-        tokens = sample["tokens"].unsqueeze(0).to(device)
-        attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
-
-        masked_tokens, labels = mask_tokens(tokens)
-        with torch.no_grad():
-            outputs = model(masked_tokens, attention_mask)
-            loss, metrics = compute_mlm_loss(outputs["logits"], labels)
-
-        # Show masked positions and predictions
-        mask_pos = (labels[0] != -100).nonzero(as_tuple=True)[0]
-        pred_ids = outputs["logits"][0].argmax(dim=-1)
-        true_ids = labels[0]
-
-        n_correct = 0
-        examples = []
-        for pos in mask_pos[:10]:  # show up to 10 positions
-            p, t = pred_ids[pos].item(), true_ids[pos].item()
-            correct = p == t
-            n_correct += int(correct)
-            pred_aa = IDX_TO_AA.get(p, "?")
-            true_aa = IDX_TO_AA.get(t, "?")
-            marker = "OK" if correct else "XX"
-            examples.append(f"  pos={pos.item():3d}: pred={pred_aa} true={true_aa} [{marker}]")
-
-        logger.info(
-            f"Seq {i}: loss={loss.item():.3f} acc={metrics['masked_accuracy']:.3f} "
-            f"ppl={metrics['perplexity']:.1f}"
-        )
-        for ex in examples:
-            logger.info(ex)
-
-    logger.info("ESM2 evaluation complete.")
 
 
 # ===========================================================================
@@ -256,11 +149,11 @@ def train_proteinmpnn():
 
 
 # ===========================================================================
-# AlphaFold2
+# AlphaFold3
 # ===========================================================================
-def train_alphafold2():
-    from alphafold2.model import AlphaFold2
-    from alphafold2.train import PDBDataset, collate_fn
+def train_alphafold3():
+    from alphafold3.model import AlphaFold3
+    from alphafold3.train import PDBDataset, collate_fn
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -272,7 +165,7 @@ def train_alphafold2():
     logger.info(f"Dataset: {len(dataset)} proteins")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
-    model = AlphaFold2().to(device)
+    model = AlphaFold3().to(device)
     logger.info(f"Parameters: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -304,7 +197,7 @@ def train_alphafold2():
             if global_step % LOG_EVERY == 0:
                 logger.info(
                     f"step={global_step} epoch={epoch+1} loss={loss.item():.4f} "
-                    f"fape={outputs['fape'].item():.4f}"
+                    f"diffusion_loss={outputs['diffusion_loss'].item():.4f}"
                 )
 
     ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
@@ -316,7 +209,7 @@ def train_alphafold2():
     logger.info("EVALUATION: Structure Prediction")
     logger.info("=" * 60)
 
-    from alphafold2.train import parse_pdb
+    from alphafold3.train import parse_pdb
 
     eval_pdbs = ["1CRN.pdb", "1UBQ.pdb", "2GB1.pdb"]
     for pdb_name in eval_pdbs:
@@ -351,7 +244,7 @@ def train_alphafold2():
             f"mean_pLDDT={plddt.mean().item():.3f}"
         )
 
-    logger.info("AlphaFold2 evaluation complete.")
+    logger.info("AlphaFold3 evaluation complete.")
 
 
 # ===========================================================================
@@ -467,9 +360,8 @@ if __name__ == "__main__":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     dispatch = {
-        "esm2": train_esm2,
         "proteinmpnn": train_proteinmpnn,
-        "alphafold2": train_alphafold2,
+        "alphafold3": train_alphafold3,
         "rfdiffusion": train_rfdiffusion,
     }
     dispatch[args.model]()

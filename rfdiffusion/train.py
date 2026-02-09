@@ -23,14 +23,15 @@ logger = logging.getLogger(__name__)
 # Training constants
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 4
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 300
-WARMUP_STEPS = 500
+BATCH_SIZE = 9
+LEARNING_RATE = 5e-4
+NUM_EPOCHS = 10000
+WARMUP_STEPS = 50
 GRADIENT_CLIP = 1.0
 MAX_SEQ_LEN = 150
+NUM_REPEATS = 8  # each protein gets multiple noise realizations per epoch
 SEED = 42
-LOG_EVERY = 10
+LOG_EVERY = 200
 
 # ---------------------------------------------------------------------------
 # PDB parser (inlined)
@@ -134,9 +135,16 @@ def pad_protein(protein: dict, max_len: int) -> dict:
 
 
 class PDBDataset(Dataset):
-    def __init__(self, data_dir: Path, max_length: int = MAX_SEQ_LEN, min_length: int = 20):
+    def __init__(
+        self,
+        data_dir: Path,
+        max_length: int = MAX_SEQ_LEN,
+        min_length: int = 20,
+        num_repeats: int = 1,
+    ):
         self.proteins = []
         self.max_length = max_length
+        self.num_repeats = num_repeats
         for pdb_path in sorted(data_dir.glob("*.pdb")):
             try:
                 protein = parse_pdb(pdb_path)
@@ -146,13 +154,16 @@ class PDBDataset(Dataset):
                         self.proteins.append(protein)
             except Exception as e:
                 logger.warning(f"Failed to parse {pdb_path.name}: {e}")
-        logger.info(f"Loaded {len(self.proteins)} proteins")
+        logger.info(
+            f"Loaded {len(self.proteins)} proteins (x{num_repeats} repeats"
+            f" = {len(self)} effective samples)"
+        )
 
     def __len__(self):
-        return len(self.proteins)
+        return len(self.proteins) * self.num_repeats
 
     def __getitem__(self, idx):
-        return pad_protein(self.proteins[idx], self.max_length)
+        return pad_protein(self.proteins[idx % len(self.proteins)], self.max_length)
 
 
 def collate_fn(batch):
@@ -171,7 +182,7 @@ def train(data_dir: str, output_dir: str = "outputs/rfdiffusion") -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = PDBDataset(Path(data_dir))
+    dataset = PDBDataset(Path(data_dir), num_repeats=NUM_REPEATS)
     if len(dataset) == 0:
         raise ValueError(f"No valid proteins in {data_dir}")
 
@@ -211,7 +222,7 @@ def train(data_dir: str, output_dir: str = "outputs/rfdiffusion") -> None:
                     f"trans={outputs['trans_loss'].item():.3f} rot={outputs['rot_loss'].item():.3f}"
                 )
 
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 1000 == 0:
             ckpt = {"model_state_dict": model.state_dict()}
             torch.save(ckpt, output_dir / f"ckpt_ep{epoch + 1}.pt")
 
