@@ -49,39 +49,39 @@ def protein():
 
 
 def test_triangular_multiplicative_update():
-    L, c_z = 10, 16
+    B, L, c_z = 2, 10, 16
     for mode in ("outgoing", "incoming"):
         tri = TriangularMultiplicativeUpdate(c_z, c_z, mode=mode)
-        out = tri(torch.randn(L, L, c_z))
-        assert out.shape == (L, L, c_z)
+        out = tri(torch.randn(B, L, L, c_z))
+        assert out.shape == (B, L, L, c_z)
         assert torch.isfinite(out).all()
 
 
 def test_triangular_attention():
-    L, c_z = 10, 16
+    B, L, c_z = 2, 10, 16
     for mode in ("starting", "ending"):
         tri = TriangularAttention(c_z, n_heads=4, mode=mode)
-        out = tri(torch.randn(L, L, c_z))
-        assert out.shape == (L, L, c_z)
+        out = tri(torch.randn(B, L, L, c_z))
+        assert out.shape == (B, L, L, c_z)
         assert torch.isfinite(out).all()
 
 
 def test_attention_with_pair_bias_shape():
-    L, c_s, c_z = 10, 64, 16
+    B, L, c_s, c_z = 2, 10, 64, 16
     attn = AttentionWithPairBias(c_s, c_z, n_heads=4)
-    single = torch.randn(L, c_s)
-    pair = torch.randn(L, L, c_z)
+    single = torch.randn(B, L, c_s)
+    pair = torch.randn(B, L, L, c_z)
     out = attn(single, pair)
-    assert out.shape == (L, c_s)
+    assert out.shape == (B, L, c_s)
     assert torch.isfinite(out).all()
 
 
 def test_pairformer_block_shape():
-    L, c_s, c_z = 10, 64, 16
+    B, L, c_s, c_z = 2, 10, 64, 16
     block = PairformerBlock(c_s, c_z, n_heads=4)
-    single, pair = block(torch.randn(L, c_s), torch.randn(L, L, c_z))
-    assert single.shape == (L, c_s)
-    assert pair.shape == (L, L, c_z)
+    single, pair = block(torch.randn(B, L, c_s), torch.randn(B, L, L, c_z))
+    assert single.shape == (B, L, c_s)
+    assert pair.shape == (B, L, L, c_z)
     assert torch.isfinite(single).all()
     assert torch.isfinite(pair).all()
 
@@ -104,30 +104,30 @@ def test_edm_noise_schedule():
 
 
 def test_diffusion_module_shape():
-    L, c_s, c_z, c_atom = 10, 64, 16, 64
+    B, L, c_s, c_z, c_atom = 2, 10, 64, 16, 64
     module = DiffusionModule(c_s=c_s, c_z=c_z, c_atom=c_atom, n_blocks=1, n_heads=4)
-    x_noisy = torch.randn(L, 3)
-    sigma = torch.tensor(1.0)
-    single = torch.randn(L, c_s)
-    pair = torch.randn(L, L, c_z)
+    x_noisy = torch.randn(B, L, 3)
+    sigma = torch.ones(B)
+    single = torch.randn(B, L, c_s)
+    pair = torch.randn(B, L, L, c_z)
     x_denoised = module(x_noisy, sigma, single, pair)
-    assert x_denoised.shape == (L, 3)
+    assert x_denoised.shape == (B, L, 3)
     assert torch.isfinite(x_denoised).all()
 
 
 def test_diffusion_loss_zero_for_perfect():
-    L = 10
-    x_true = torch.randn(L, 3)
-    sigma = torch.tensor(1.0)
+    B, L = 2, 10
+    x_true = torch.randn(B, L, 3)
+    sigma = torch.ones(B)
     loss = diffusion_loss(x_true, x_true, sigma)
     assert loss.item() < 1e-5
 
 
 def test_diffusion_loss_positive_for_imperfect():
-    L = 10
-    x_true = torch.randn(L, 3)
-    x_pred = x_true + torch.randn(L, 3) * 2.0
-    sigma = torch.tensor(1.0)
+    B, L = 2, 10
+    x_true = torch.randn(B, L, 3)
+    x_pred = x_true + torch.randn(B, L, 3) * 2.0
+    sigma = torch.ones(B)
     loss = diffusion_loss(x_pred, x_true, sigma)
     assert loss.item() > 0.1
     assert torch.isfinite(loss)

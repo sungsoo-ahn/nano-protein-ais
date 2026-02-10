@@ -137,9 +137,16 @@ def pad_protein(protein: dict, max_len: int) -> dict:
 
 
 class PDBDataset(Dataset):
-    def __init__(self, data_dir: Path, max_length: int = MAX_SEQ_LEN, min_length: int = 20):
+    def __init__(
+        self,
+        data_dir: Path,
+        max_length: int = MAX_SEQ_LEN,
+        min_length: int = 20,
+        num_repeats: int = 1,
+    ):
         self.proteins = []
         self.max_length = max_length
+        self.num_repeats = num_repeats
         for pdb_path in sorted(data_dir.glob("*.pdb")):
             try:
                 protein = parse_pdb(pdb_path)
@@ -149,13 +156,16 @@ class PDBDataset(Dataset):
                         self.proteins.append(protein)
             except Exception as e:
                 logger.warning(f"Failed to parse {pdb_path.name}: {e}")
-        logger.info(f"Loaded {len(self.proteins)} proteins")
+        logger.info(
+            f"Loaded {len(self.proteins)} proteins (x{num_repeats} repeats"
+            f" = {len(self)} effective samples)"
+        )
 
     def __len__(self):
-        return len(self.proteins)
+        return len(self.proteins) * self.num_repeats
 
     def __getitem__(self, idx):
-        return pad_protein(self.proteins[idx], self.max_length)
+        return pad_protein(self.proteins[idx % len(self.proteins)], self.max_length)
 
 
 def collate_fn(batch):

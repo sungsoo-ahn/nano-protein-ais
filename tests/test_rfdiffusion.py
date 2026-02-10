@@ -118,11 +118,11 @@ def test_denoising_network_shape():
         n_v_points=2,
         self_conditioning=True,
     )
-    L = 10
-    frames = RigidTransform.identity((L,))
-    pred = net(frames, torch.tensor(0.5))
-    assert pred.rots.shape == (L, 3, 3)
-    assert pred.trans.shape == (L, 3)
+    B, L = 2, 10
+    frames = RigidTransform.identity((B, L))
+    pred = net(frames, torch.tensor([0.5, 0.3]))
+    assert pred.rots.shape == (B, L, 3, 3)
+    assert pred.trans.shape == (B, L, 3)
     assert torch.isfinite(pred.rots).all()
     assert torch.isfinite(pred.trans).all()
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Train all 3 models in parallel, each on its own GPU.
+# Train all 4 models in parallel, each on its own GPU.
 set -e
 
 cd "$(dirname "$0")/.."
-mkdir -p outputs/{proteinmpnn,alphafold3,rfdiffusion}
+mkdir -p outputs/{proteinmpnn,alphafold3,rfdiffusion,esm2}
 
-echo "Launching all 3 models in parallel..."
+echo "Launching all 4 models in parallel..."
 python scripts/train_and_eval.py --model proteinmpnn   --gpu 0 2>&1 | tee outputs/proteinmpnn/console.log &
 python scripts/train_and_eval.py --model alphafold3    --gpu 1 2>&1 | tee outputs/alphafold3/console.log &
 python scripts/train_and_eval.py --model rfdiffusion   --gpu 2 2>&1 | tee outputs/rfdiffusion/console.log &
+python scripts/train_and_eval.py --model esm2          --gpu 3 2>&1 | tee outputs/esm2/console.log &
 
 echo "Waiting for all models to finish..."
 wait

@@ -6,6 +6,8 @@ diffusion-based structure module using EDM/Karras preconditioning.
 Core ideas: Pairformer replaces Evoformer (drops MSA axis entirely), coordinate
 diffusion replaces IPA-based frame refinement.
 
+All modules expect batched inputs with a leading B dimension.
+
 Total parameters: ~30M with default config.
 """
 
@@ -117,6 +119,7 @@ def pairwise_distances(coords: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------
 # Pairformer (replaces Evoformer — no MSA axis)
+# All modules expect batched input: single [B,L,C_S], pair [B,L,L,C_Z]
 # ---------------------------------------------------------------------------
 
 
@@ -134,13 +137,14 @@ class TriangularMultiplicativeUpdate(nn.Module):
         self.final_norm = nn.LayerNorm(c_hidden)
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
+        """pair: [B, L, L, c_z]"""
         z = self.ln(pair)
         left = self.left_proj(z) * torch.sigmoid(self.left_gate(z))
         right = self.right_proj(z) * torch.sigmoid(self.right_gate(z))
         if self.mode == "outgoing":
-            out = torch.einsum("ikc,jkc->ijc", left, right)
+            out = torch.einsum("bikc,bjkc->bijc", left, right)
         else:
-            out = torch.einsum("kic,kjc->ijc", left, right)
+            out = torch.einsum("bkic,bkjc->bijc", left, right)
         out = self.output_proj(self.final_norm(out))
         return pair + torch.sigmoid(self.output_gate(pair)) * out
 
@@ -159,20 +163,22 @@ class TriangularAttention(nn.Module):
         self.gate = nn.Linear(c_z, c_z)
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
-        L = pair.shape[0]
+        """pair: [B, L, L, c_z]"""
+        B, L = pair.shape[0], pair.shape[1]
         if self.mode == "ending":
-            pair = pair.transpose(0, 1).contiguous()
+            pair = pair.transpose(1, 2).contiguous()
         z = self.ln(pair)
-        q = self.to_q(z).view(L, L, self.n_heads, self.head_dim)
-        k = self.to_k(z).view(L, L, self.n_heads, self.head_dim)
-        v = self.to_v(z).view(L, L, self.n_heads, self.head_dim)
-        attn = torch.einsum("ijhd,ikhd->hijk", q, k) / (self.head_dim**0.5)
-        attn = attn + self.bias_proj(z).permute(2, 0, 1).unsqueeze(1)
+        q = self.to_q(z).view(B, L, L, self.n_heads, self.head_dim)
+        k = self.to_k(z).view(B, L, L, self.n_heads, self.head_dim)
+        v = self.to_v(z).view(B, L, L, self.n_heads, self.head_dim)
+        attn = torch.einsum("bijhd,bikhd->bhijk", q, k) / (self.head_dim**0.5)
+        # bias: [B,L,L,H] → [B,H,L,1,L] to broadcast over j
+        attn = attn + self.bias_proj(z).permute(0, 3, 1, 2).unsqueeze(2)
         attn = torch.softmax(attn, dim=-1)
-        out = torch.einsum("hijk,ikhd->ijhd", attn, v).reshape(L, L, self.c_z)
+        out = torch.einsum("bhijk,bikhd->bijhd", attn, v).reshape(B, L, L, self.c_z)
         result = pair + torch.sigmoid(self.gate(pair)) * self.to_out(out)
         if self.mode == "ending":
-            result = result.transpose(0, 1).contiguous()
+            result = result.transpose(1, 2).contiguous()
         return result
 
 
@@ -188,7 +194,7 @@ class Transition(nn.Module):
 
 
 class AttentionWithPairBias(nn.Module):
-    """Self-attention on single rep [L, C_S] with pair bias from [L, L, C_Z]."""
+    """Self-attention on single rep [B, L, C_S] with pair bias from [B, L, L, C_Z]."""
 
     def __init__(self, c_s: int, c_z: int, n_heads: int):
         super().__init__()
@@ -204,16 +210,17 @@ class AttentionWithPairBias(nn.Module):
         self.gate = nn.Linear(c_s, c_s)
 
     def forward(self, single: torch.Tensor, pair: torch.Tensor) -> torch.Tensor:
-        L = single.shape[0]
+        """single: [B, L, c_s], pair: [B, L, L, c_z]"""
+        B, L = single.shape[:2]
         s = self.ln_s(single)
         z = self.ln_z(pair)
-        q = self.to_q(s).view(L, self.n_heads, self.head_dim)
-        k = self.to_k(s).view(L, self.n_heads, self.head_dim)
-        v = self.to_v(s).view(L, self.n_heads, self.head_dim)
-        attn = torch.einsum("ihd,jhd->hij", q, k) / (self.head_dim**0.5)
-        attn = attn + self.pair_bias(z).permute(2, 0, 1)
+        q = self.to_q(s).view(B, L, self.n_heads, self.head_dim)
+        k = self.to_k(s).view(B, L, self.n_heads, self.head_dim)
+        v = self.to_v(s).view(B, L, self.n_heads, self.head_dim)
+        attn = torch.einsum("bihd,bjhd->bhij", q, k) / (self.head_dim**0.5)
+        attn = attn + self.pair_bias(z).permute(0, 3, 1, 2)
         attn = torch.softmax(attn, dim=-1)
-        out = torch.einsum("hij,jhd->ihd", attn, v).reshape(L, self.c_s)
+        out = torch.einsum("bhij,bjhd->bihd", attn, v).reshape(B, L, self.c_s)
         return single + torch.sigmoid(self.gate(s)) * self.to_out(out)
 
 
@@ -305,6 +312,7 @@ class EDMNoiseSchedule:
 
 # ---------------------------------------------------------------------------
 # Diffusion Module (replaces Structure Module)
+# All inputs batched: x [B,L,3], sigma [B], single [B,L,C_S], pair [B,L,L,C_Z]
 # ---------------------------------------------------------------------------
 
 
@@ -316,6 +324,7 @@ class FourierTimeEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, sigma: torch.Tensor) -> torch.Tensor:
+        """sigma: [B] or [] → output: [B, dim] or [dim]"""
         half = self.dim // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=sigma.device) / half)
         args = sigma.unsqueeze(-1) * freqs
@@ -333,9 +342,11 @@ class AdaLN(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """x: [B, L, dim], cond: [B, dim]"""
         scale_shift = self.proj(cond)
-        if cond.dim() == 1:
-            scale_shift = scale_shift.unsqueeze(0).expand(x.shape[0], -1)
+        # Broadcast cond over sequence dimension
+        while scale_shift.dim() < x.dim():
+            scale_shift = scale_shift.unsqueeze(-2)
         scale, shift = scale_shift.chunk(2, dim=-1)
         return self.ln(x) * (1 + scale) + shift
 
@@ -361,18 +372,17 @@ class DiffusionTransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, pair: torch.Tensor, time_cond: torch.Tensor) -> torch.Tensor:
-        L = x.shape[0]
-        # Self-attention with pair bias and AdaLN
+        """x: [B,L,c_atom], pair: [B,L,L,c_z], time_cond: [B,c_atom]"""
+        B, L = x.shape[:2]
         h = self.adaln1(x, time_cond)
-        q = self.to_q(h).view(L, self.n_heads, self.head_dim)
-        k = self.to_k(h).view(L, self.n_heads, self.head_dim)
-        v = self.to_v(h).view(L, self.n_heads, self.head_dim)
-        attn = torch.einsum("ihd,jhd->hij", q, k) / (self.head_dim**0.5)
-        attn = attn + self.pair_bias(pair).permute(2, 0, 1)
+        q = self.to_q(h).view(B, L, self.n_heads, self.head_dim)
+        k = self.to_k(h).view(B, L, self.n_heads, self.head_dim)
+        v = self.to_v(h).view(B, L, self.n_heads, self.head_dim)
+        attn = torch.einsum("bihd,bjhd->bhij", q, k) / (self.head_dim**0.5)
+        attn = attn + self.pair_bias(pair).permute(0, 3, 1, 2)
         attn = torch.softmax(attn, dim=-1)
-        out = torch.einsum("hij,jhd->ihd", attn, v).reshape(L, self.c_atom)
+        out = torch.einsum("bhij,bjhd->bihd", attn, v).reshape(B, L, self.c_atom)
         x = x + self.to_out(out)
-        # FFN with AdaLN
         x = x + self.ffn(self.adaln2(x, time_cond))
         return x
 
@@ -422,32 +432,32 @@ class DiffusionModule(nn.Module):
         """Predict denoised coordinates with EDM preconditioning.
 
         Args:
-            x_noisy: [L, 3] noisy coordinates
-            sigma: [] scalar noise level
-            single: [L, C_S] single representation from Pairformer
-            pair: [L, L, C_Z] pair representation from Pairformer
+            x_noisy: [B, L, 3] noisy coordinates
+            sigma: [B] noise levels
+            single: [B, L, C_S] single representation from Pairformer
+            pair: [B, L, L, C_Z] pair representation from Pairformer
         Returns:
-            x_denoised: [L, 3] denoised coordinates
+            x_denoised: [B, L, 3] denoised coordinates
         """
-        c_skip = self.schedule.c_skip(sigma)
-        c_out = self.schedule.c_out(sigma)
-        c_in = self.schedule.c_in(sigma)
+        c_skip = self.schedule.c_skip(sigma)  # [B]
+        c_out = self.schedule.c_out(sigma)  # [B]
+        c_in = self.schedule.c_in(sigma)  # [B]
 
-        # Network input
-        x_scaled = c_in * x_noisy
+        # Network input: broadcast [B] → [B, 1, 1] for [B, L, 3]
+        x_scaled = c_in[:, None, None] * x_noisy
         h = self.coord_proj(x_scaled) + self.single_cond_proj(single)
 
         # Time conditioning
-        time_emb = self.time_embed(self.schedule.c_noise(sigma))
-        time_cond = self.time_mlp(time_emb)
+        time_emb = self.time_embed(self.schedule.c_noise(sigma))  # [B, c_atom]
+        time_cond = self.time_mlp(time_emb)  # [B, c_atom]
 
         for block in self.blocks:
             h = block(h, pair, time_cond)
 
-        F_out = self.output_proj(h)
+        F_out = self.output_proj(h)  # [B, L, 3]
 
         # EDM preconditioning
-        x_denoised = c_skip * x_noisy + c_out * F_out
+        x_denoised = c_skip[:, None, None] * x_noisy + c_out[:, None, None] * F_out
         return x_denoised
 
 
@@ -480,7 +490,7 @@ class PLDDTHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Losses
+# Losses (all handle batched inputs)
 # ---------------------------------------------------------------------------
 
 
@@ -491,12 +501,17 @@ def diffusion_loss(
     mask: torch.Tensor | None = None,
     sigma_data: float = SIGMA_DATA,
 ) -> torch.Tensor:
-    """Weighted MSE: λ(σ) * ||x_denoised - x_0||²."""
-    weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2
-    sq_error = ((x_denoised - x_true) ** 2).sum(-1)  # [L]
+    """Weighted MSE: λ(σ) * ||x_denoised - x_0||².
+
+    Args: x_denoised [B,L,3], x_true [B,L,3], sigma [B], mask [B,L].
+    """
+    weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data) ** 2  # [B]
+    sq_error = ((x_denoised - x_true) ** 2).sum(-1)  # [B, L]
     if mask is not None:
-        return weight * (sq_error * mask.float()).sum() / mask.sum().clamp(min=1)
-    return weight * sq_error.mean()
+        per_sample = (sq_error * mask.float()).sum(-1) / mask.float().sum(-1).clamp(min=1)
+    else:
+        per_sample = sq_error.mean(-1)
+    return (weight * per_sample).mean()
 
 
 def distogram_loss(
@@ -507,19 +522,18 @@ def distogram_loss(
     min_dist: float = 2.0,
     max_dist: float = 22.0,
 ) -> torch.Tensor:
-    diff = true_coords.unsqueeze(0) - true_coords.unsqueeze(1)
-    true_dist = torch.sqrt((diff**2).sum(-1) + 1e-8)
+    """pred_logits [B,L,L,bins], true_coords [B,L,3], mask [B,L]."""
+    diff = true_coords.unsqueeze(-2) - true_coords.unsqueeze(-3)  # [B,L,L,3]
+    true_dist = torch.sqrt((diff**2).sum(-1) + 1e-8)  # [B,L,L]
     bin_edges = torch.linspace(min_dist, max_dist, num_bins + 1, device=true_dist.device)
     true_bins = torch.bucketize(true_dist, bin_edges[1:]).clamp(0, num_bins - 1)
-    L = pred_logits.shape[0]
+    B, L = pred_logits.shape[:2]
     flat_loss = F.cross_entropy(
-        pred_logits.reshape(-1, num_bins),
-        true_bins.reshape(-1),
-        reduction="none",
+        pred_logits.reshape(-1, num_bins), true_bins.reshape(-1), reduction="none"
     )
-    loss = flat_loss.reshape(L, L)
+    loss = flat_loss.reshape(B, L, L)
     if mask is not None:
-        mask_2d = mask.unsqueeze(0) & mask.unsqueeze(1)
+        mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2)  # [B,L,L]
         return (loss * mask_2d.float()).sum() / mask_2d.sum().clamp(min=1)
     return loss.mean()
 
@@ -531,22 +545,25 @@ def plddt_loss(
     mask: torch.Tensor | None = None,
     num_bins: int = NUM_PLDDT_BINS,
 ) -> torch.Tensor:
-    diff = (pred_coords - true_coords).norm(dim=-1)
+    """pred_logits [B,L,bins], pred/true_coords [B,L,3], mask [B,L]."""
+    diff = (pred_coords - true_coords).norm(dim=-1)  # [B,L]
     lddt = torch.clamp(1.0 - diff / 15.0, 0.0, 1.0)
     true_bins = (lddt * (num_bins - 1)).long().clamp(0, num_bins - 1)
-    loss = F.cross_entropy(pred_logits, true_bins, reduction="none")
+    loss = F.cross_entropy(
+        pred_logits.reshape(-1, pred_logits.shape[-1]), true_bins.reshape(-1), reduction="none"
+    ).reshape_as(true_bins)
     if mask is not None:
         return (loss * mask.float()).sum() / mask.sum().clamp(min=1)
     return loss.mean()
 
 
 # ---------------------------------------------------------------------------
-# Input Embedding
+# Input Embedding (batched)
 # ---------------------------------------------------------------------------
 
 
 class InputEmbedding(nn.Module):
-    """Embed sequence → (single [L, C_S], pair [L, L, C_Z]). No MSA axis."""
+    """Embed sequence → (single [B, L, C_S], pair [B, L, L, C_Z]). No MSA axis."""
 
     def __init__(self, c_s: int, c_z: int):
         super().__init__()
@@ -560,13 +577,14 @@ class InputEmbedding(nn.Module):
         sequence: torch.Tensor,
         residue_index: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        L = sequence.shape[0]
-        one_hot = torch.zeros(L, 21, device=sequence.device)
-        one_hot.scatter_(1, sequence.clamp(0, 20).unsqueeze(1), 1.0)
-        single = self.single_proj(one_hot)
+        """sequence: [B, L], residue_index: [B, L]"""
+        B, L = sequence.shape
+        one_hot = torch.zeros(B, L, 21, device=sequence.device)
+        one_hot.scatter_(2, sequence.clamp(0, 20).unsqueeze(2), 1.0)
+        single = self.single_proj(one_hot)  # [B, L, c_s]
         left, right = self.left_single(one_hot), self.right_single(one_hot)
-        pair = left[:, None, :] + right[None, :, :]
-        d = torch.clamp(residue_index[:, None] - residue_index[None, :] + 32, 0, 64).long()
+        pair = left[:, :, None, :] + right[:, None, :, :]  # [B, L, L, c_z]
+        d = torch.clamp(residue_index[:, :, None] - residue_index[:, None, :] + 32, 0, 64).long()
         return single, pair + self.relpos(d)
 
 
@@ -630,91 +648,93 @@ class AlphaFold3(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Training forward pass.
+        """Training forward pass — fully batched.
 
         Args:
             batch: dict with coords_N/CA/C [B,L,3], sequence [B,L], mask [B,L].
         Returns:
             dict with loss (scalar), diffusion_loss (scalar).
         """
-        B = batch["sequence"].shape[0]
-        all_losses, all_diff_losses = [], []
+        B, L = batch["sequence"].shape
+        device = batch["sequence"].device
+        seq = batch["sequence"]
+        mask = batch["mask"]
+        true_CA = batch["coords_CA"]
 
-        for b in range(B):
-            seq, mask = batch["sequence"][b], batch["mask"][b]
-            true_CA = batch["coords_CA"][b]
-            L = seq.shape[0]
-            device = seq.device
+        # Pairformer trunk
+        residue_index = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+        single, pair = self.input_embedding(seq, residue_index)
+        for block in self.pairformer_blocks:
+            single, pair = block(single, pair)
 
-            # Pairformer trunk
-            single, pair = self.input_embedding(seq, torch.arange(L, device=device))
-            for block in self.pairformer_blocks:
-                single, pair = block(single, pair)
+        # Sample sigma per sample and noise coordinates
+        sigma = self.noise_schedule.sample_sigma(B, device)  # [B]
+        eps = torch.randn_like(true_CA)
+        x_noisy = true_CA + sigma[:, None, None] * eps  # [B, L, 3]
 
-            # Sample sigma and noise coordinates
-            sigma = self.noise_schedule.sample_sigma(1, device).squeeze(0)
-            eps = torch.randn_like(true_CA)
-            x_noisy = true_CA + sigma * eps
+        # Diffusion module predicts denoised coords
+        x_denoised = self.diffusion_module(x_noisy, sigma, single, pair)
 
-            # Diffusion module predicts denoised coords
-            x_denoised = self.diffusion_module(x_noisy, sigma, single, pair)
+        # Losses
+        loss_diff = diffusion_loss(x_denoised, true_CA, sigma, mask, self.sigma_data)
 
-            # Losses
-            loss_diff = diffusion_loss(x_denoised, true_CA, sigma, mask, self.sigma_data)
+        dist_logits = self.distogram_head(pair)
+        loss_dist = distogram_loss(dist_logits, true_CA, mask, self.num_dist_bins)
 
-            dist_logits = self.distogram_head(pair)
-            loss_dist = distogram_loss(dist_logits, true_CA, mask, self.num_dist_bins)
+        plddt_logits = self.plddt_head(single)
+        loss_plddt = plddt_loss(
+            plddt_logits, x_denoised.detach(), true_CA, mask, self.num_plddt_bins
+        )
 
-            plddt_logits = self.plddt_head(single)
-            loss_plddt = plddt_loss(
-                plddt_logits, x_denoised.detach(), true_CA, mask, self.num_plddt_bins
-            )
-
-            total = (
-                self.diffusion_weight * loss_diff
-                + self.distogram_weight * loss_dist
-                + self.plddt_weight * loss_plddt
-            )
-            all_losses.append(total)
-            all_diff_losses.append(loss_diff)
+        total = (
+            self.diffusion_weight * loss_diff
+            + self.distogram_weight * loss_dist
+            + self.plddt_weight * loss_plddt
+        )
 
         return {
-            "loss": torch.stack(all_losses).mean(),
-            "diffusion_loss": torch.stack(all_diff_losses).mean(),
+            "loss": total,
+            "diffusion_loss": loss_diff,
         }
 
     @torch.no_grad()
     def predict(self, sequence: torch.Tensor) -> dict[str, torch.Tensor]:
         """Predict structure from sequence via iterative denoising.
 
-        Returns coords [L,3] and plddt [L].
+        Args:
+            sequence: [L] unbatched sequence tensor.
+        Returns:
+            coords [L,3] and plddt [L].
         """
         self.eval()
         L = sequence.shape[0]
         device = sequence.device
 
-        # Pairformer trunk
-        single, pair = self.input_embedding(sequence, torch.arange(L, device=device))
+        # Add batch dim for batched modules
+        seq = sequence.unsqueeze(0)  # [1, L]
+        residue_index = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+        single, pair = self.input_embedding(seq, residue_index)
         for block in self.pairformer_blocks:
             single, pair = block(single, pair)
 
         # Iterative denoising (Euler ODE sampler)
         schedule = self.noise_schedule
         sigmas = schedule.sample_schedule(NUM_SAMPLE_STEPS, device)
-        x = sigmas[0] * torch.randn(L, 3, device=device)
+        x = sigmas[0] * torch.randn(1, L, 3, device=device)  # [1, L, 3]
 
         for i in range(len(sigmas) - 1):
-            sigma_i = sigmas[i]
+            sigma_i = sigmas[i].unsqueeze(0)  # [1]
             sigma_next = sigmas[i + 1]
             x_denoised = self.diffusion_module(x, sigma_i, single, pair)
-            # Euler step: score = (x - D) / sigma^2, dx = score * (sigma_next - sigma_i)
-            # Simplified: x = x + (sigma_next - sigma_i) / sigma_i * (x - x_denoised)
-            if sigma_i > 0:
-                d = (x - x_denoised) / sigma_i
-                x = x + (sigma_next - sigma_i) * d
+            if sigmas[i] > 0:
+                d = (x - x_denoised) / sigmas[i]
+                x = x + (sigma_next - sigmas[i]) * d
+
+        # Remove batch dim
+        x = x.squeeze(0)  # [L, 3]
 
         # pLDDT
-        plddt_logits = self.plddt_head(single)
+        plddt_logits = self.plddt_head(single).squeeze(0)  # [L, bins]
         plddt = torch.softmax(plddt_logits, dim=-1)
         bins = torch.linspace(0, 1, self.num_plddt_bins, device=device)
         plddt_score = (plddt * bins).sum(dim=-1)

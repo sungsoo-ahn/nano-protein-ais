@@ -3,6 +3,8 @@
 Self-contained implementation with SO(3)+R(3) noise schedules, denoising
 network with IPA, triangular updates, and reverse diffusion sampling.
 
+All network modules expect batched inputs with a leading B dimension.
+
 Total parameters: ~35M with default config.
 """
 
@@ -132,9 +134,16 @@ def compute_local_frame(N: torch.Tensor, CA: torch.Tensor, C: torch.Tensor) -> R
 
 
 def sample_igso3(shape: tuple, sigma, device=torch.device("cpu")) -> torch.Tensor:
-    """Sample from Isotropic Gaussian on SO(3)."""
-    if isinstance(sigma, (int, float)):
-        omega = torch.abs(torch.randn(*shape, device=device) * sigma)
+    """Sample from Isotropic Gaussian on SO(3).
+
+    Works with scalar sigma or tensor sigma that broadcasts with shape.
+    """
+    if isinstance(sigma, torch.Tensor):
+        # Ensure sigma broadcasts: add trailing dims to match shape
+        s = sigma
+        while s.dim() < len(shape):
+            s = s.unsqueeze(-1)
+        omega = torch.abs(torch.randn(*shape, device=device) * s)
     else:
         omega = torch.abs(torch.randn(*shape, device=device) * sigma)
     axis = torch.randn(*shape, 3, device=device)
@@ -228,7 +237,8 @@ class SE3Diffusion:
 
 
 # ---------------------------------------------------------------------------
-# Network modules (IPA, TriangularUpdate inlined from AF2-like architecture)
+# Network modules (IPA, TriangularUpdate)
+# All expect batched inputs: node [B,L,D], pair [B,L,L,D], frames [B,L,...]
 # ---------------------------------------------------------------------------
 
 
@@ -257,13 +267,14 @@ class TriangularMultiplicativeUpdate(nn.Module):
         self.final_norm = nn.LayerNorm(c_hidden)
 
     def forward(self, pair):
+        """pair: [B, L, L, c_z]"""
         z = self.ln(pair)
         left = self.left_proj(z) * torch.sigmoid(self.left_gate(z))
         right = self.right_proj(z) * torch.sigmoid(self.right_gate(z))
         if self.mode == "outgoing":
-            out = torch.einsum("ikc,jkc->ijc", left, right)
+            out = torch.einsum("bikc,bjkc->bijc", left, right)
         else:
-            out = torch.einsum("kic,kjc->ijc", left, right)
+            out = torch.einsum("bkic,bkjc->bijc", left, right)
         out = self.output_proj(self.final_norm(out))
         return pair + torch.sigmoid(self.output_gate(pair)) * out
 
@@ -294,42 +305,58 @@ class InvariantPointAttention(nn.Module):
         self.to_out = nn.Linear(out_dim, c_s)
 
     def forward(self, single, pair, rigids):
-        L = single.shape[0]
+        """single: [B,L,c_s], pair: [B,L,L,c_z], rigids: RigidTransform [B,L,...]"""
+        B, L = single.shape[:2]
         s = self.ln(single)
-        q = self.to_q(s).view(L, self.n_heads, self.head_dim)
-        k = self.to_k(s).view(L, self.n_heads, self.head_dim)
-        v = self.to_v(s).view(L, self.n_heads, self.head_dim)
-        q_pts = self.to_q_pts(s).view(L, self.n_heads, self.n_qk_points, 3)
-        k_pts = self.to_k_pts(s).view(L, self.n_heads, self.n_qk_points, 3)
-        v_pts = self.to_v_pts(s).view(L, self.n_heads, self.n_v_points, 3)
+        q = self.to_q(s).view(B, L, self.n_heads, self.head_dim)
+        k = self.to_k(s).view(B, L, self.n_heads, self.head_dim)
+        v = self.to_v(s).view(B, L, self.n_heads, self.head_dim)
+        q_pts = self.to_q_pts(s).view(B, L, self.n_heads, self.n_qk_points, 3)
+        k_pts = self.to_k_pts(s).view(B, L, self.n_heads, self.n_qk_points, 3)
+        v_pts = self.to_v_pts(s).view(B, L, self.n_heads, self.n_v_points, 3)
 
         def apply_frames(pts):
-            HP = pts.shape[1] * pts.shape[2]
-            flat = pts.reshape(L, HP, 3)
-            rotated = torch.einsum("lij,lnj->lni", rigids.rots, flat)
-            return (rotated + rigids.trans[:, None, :]).view_as(pts)
+            # pts: [B, L, H, P, 3] → apply rigid per residue
+            HP = pts.shape[2] * pts.shape[3]
+            flat = pts.reshape(B, L, HP, 3)
+            # rigids.rots: [B, L, 3, 3]
+            rotated = torch.einsum("blij,blnj->blni", rigids.rots, flat)
+            return (rotated + rigids.trans[:, :, None, :]).view_as(pts)
 
         q_g, k_g, v_g = apply_frames(q_pts), apply_frames(k_pts), apply_frames(v_pts)
-        attn = torch.einsum("ihd,jhd->hij", q, k) / (self.head_dim**0.5)
-        pt_diff = q_g[:, None] - k_g[None, :]
-        pt_dist_sq = (pt_diff**2).sum(-1).sum(-1)
+
+        # Scalar attention
+        attn = torch.einsum("bihd,bjhd->bhij", q, k) / (self.head_dim**0.5)
+
+        # Point attention
+        pt_diff = q_g[:, :, None] - k_g[:, None, :]  # [B, L, L, H, P, 3]
+        pt_dist_sq = (pt_diff**2).sum(-1).sum(-1)  # [B, L, L, H]
         w_c = F.softplus(self.head_weights)
-        attn = attn - 0.5 * w_c[:, None, None] * pt_dist_sq.permute(2, 0, 1)
-        attn = attn + self.pair_bias(pair).permute(2, 0, 1)
+        attn = attn - 0.5 * w_c[None, :, None, None] * pt_dist_sq.permute(0, 3, 1, 2)
+
+        # Pair bias
+        attn = attn + self.pair_bias(pair).permute(0, 3, 1, 2)
         attn = torch.softmax(attn, dim=-1)
-        out_scalar = torch.einsum("hij,jhd->ihd", attn, v).reshape(L, self.c_s)
-        out_pts_g = torch.einsum("hij,jhpc->ihpc", attn, v_g)
-        inv_rots = rigids.rots.transpose(-1, -2)
+
+        # Outputs
+        out_scalar = torch.einsum("bhij,bjhd->bihd", attn, v).reshape(B, L, self.c_s)
+        out_pts_g = torch.einsum("bhij,bjhpc->bihpc", attn, v_g)
+
+        # Transform points back to local frame
+        inv_rots = rigids.rots.transpose(-1, -2)  # [B, L, 3, 3]
         HP_v = self.n_heads * self.n_v_points
-        flat_pts = out_pts_g.reshape(L, HP_v, 3) - rigids.trans[:, None, :]
-        out_pts_l = torch.einsum("lij,lnj->lni", inv_rots, flat_pts).reshape(L, HP_v * 3)
+        flat_pts = out_pts_g.reshape(B, L, HP_v, 3) - rigids.trans[:, :, None, :]
+        out_pts_l = torch.einsum("blij,blnj->blni", inv_rots, flat_pts).reshape(B, L, HP_v * 3)
+
+        # Pair output
         n_pair = self.n_heads * pair.shape[-1]
-        out_pair = torch.einsum("hij,ijc->ihc", attn, pair).reshape(L, n_pair)
+        out_pair = torch.einsum("bhij,bijc->bihc", attn, pair).reshape(B, L, n_pair)
+
         return self.to_out(torch.cat([out_scalar, out_pts_l, out_pair], -1))
 
 
 # ---------------------------------------------------------------------------
-# Denoising Network
+# Denoising Network (batched)
 # ---------------------------------------------------------------------------
 
 
@@ -367,20 +394,24 @@ class DenoisingBlock(nn.Module):
         nn.init.zeros_(self.frame_update.bias)
 
     def forward(self, node_feat, pair_feat, frames, t_embed):
-        node_feat = node_feat + self.time_proj(t_embed).unsqueeze(0)
+        """node_feat: [B,L,D], pair_feat: [B,L,L,D], frames: [B,L,...], t_embed: [B,D]"""
+        node_feat = node_feat + self.time_proj(t_embed).unsqueeze(1)
         node_feat = node_feat + self.ipa(self.ipa_norm(node_feat), pair_feat, frames)
         node_feat = self.transition(node_feat)
         pair_feat = self.tri_out(pair_feat)
         pair_feat = self.tri_in(pair_feat)
         pair_feat = self.pair_transition(pair_feat)
         update = self.frame_update(self.frame_norm(node_feat))
-        rot_mat = axis_angle_to_rotation_matrix(update[:, :3] * 0.1)
-        frames = frames.compose(RigidTransform(rot_mat, update[:, 3:]))
+        rot_mat = axis_angle_to_rotation_matrix(update[..., :3] * 0.1)
+        frames = frames.compose(RigidTransform(rot_mat, update[..., 3:]))
         return node_feat, pair_feat, frames
 
 
 class DenoisingNetwork(nn.Module):
-    """Takes noisy frames + timestep, produces predicted clean frames."""
+    """Takes noisy frames + timestep, produces predicted clean frames.
+
+    Batched: noisy_frames [B,L,...], t [B].
+    """
 
     def __init__(
         self,
@@ -414,25 +445,35 @@ class DenoisingNetwork(nn.Module):
         nn.init.zeros_(self.trans_head.bias)
 
     def forward(self, noisy_frames, t, prev_pred=None):
-        L = noisy_frames.trans.shape[0]
+        """noisy_frames: RigidTransform [B,L,...], t: [B]"""
+        B, L = noisy_frames.trans.shape[:2]
         device = noisy_frames.trans.device
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        t_embed = self.time_embed(t).squeeze(0)
-        frame_7d = noisy_frames.to_tensor_7()
+        if t.shape[0] == 1 and B > 1:
+            t = t.expand(B)
+        t_embed = self.time_embed(t)  # [B, node_dim]
+
+        frame_7d = noisy_frames.to_tensor_7()  # [B, L, 7]
         if self.self_conditioning and prev_pred is not None:
             node_input = torch.cat([frame_7d, prev_pred.to_tensor_7().detach()], dim=-1)
         elif self.self_conditioning:
             node_input = torch.cat([frame_7d, torch.zeros_like(frame_7d)], dim=-1)
         else:
             node_input = frame_7d
-        node_feat = self.node_proj(node_input)
+
+        node_feat = self.node_proj(node_input)  # [B, L, node_dim]
+
+        # Pair features: relative position encoding (shared across batch)
         idx = torch.arange(L, device=device)
         d = torch.clamp(idx[:, None] - idx[None, :] + 32, 0, 64).long()
-        pair_feat = self.pair_proj(F.one_hot(d, 65).float())
+        pair_feat = self.pair_proj(F.one_hot(d, 65).float())  # [L, L, pair_dim]
+        pair_feat = pair_feat.unsqueeze(0).expand(B, -1, -1, -1)  # [B, L, L, pair_dim]
+
         frames = RigidTransform(noisy_frames.rots.clone(), noisy_frames.trans.clone())
         for block in self.blocks:
             node_feat, pair_feat, frames = block(node_feat, pair_feat, frames, t_embed)
+
         h = self.output_norm(node_feat)
         pred_rots = axis_angle_to_rotation_matrix(self.rot_head(h))
         correction = RigidTransform(pred_rots, self.trans_head(h))
@@ -483,30 +524,26 @@ class RFDiffusion(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Batched training forward pass.
+
+        Args:
+            batch: dict with coords_N/CA/C [B,L,3], mask [B,L].
+        """
         B = batch["coords_CA"].shape[0]
         device = batch["coords_CA"].device
-        all_losses, all_trans, all_rot = [], [], []
+        mask = batch["mask"]
+        N, CA, C = batch["coords_N"], batch["coords_CA"], batch["coords_C"]
+        true_frames = compute_local_frame(N, CA, C)  # [B, L, ...]
 
-        for b in range(B):
-            mask = batch["mask"][b]
-            N, CA, C = batch["coords_N"][b], batch["coords_CA"][b], batch["coords_C"][b]
-            true_frames = compute_local_frame(N, CA, C)
+        t = torch.rand(B, device=device)  # one timestep per sample
+        # Expand t to [B, L] for diffusion (all residues share same timestep)
+        t_expanded = t[:, None].expand(-1, CA.shape[1])
+        noisy_frames, _ = self.diffusion.forward_marginal(true_frames, t_expanded)
+        pred_frames = self.network(noisy_frames, t)
 
-            t = torch.rand(1, device=device).squeeze()
-            noisy_frames, _ = self.diffusion.forward_marginal(true_frames, t.expand(CA.shape[0]))
-            pred_frames = self.network(noisy_frames, t)
-
-            trans_loss, rot_loss = self._compute_loss(pred_frames, true_frames, mask)
-            total = self.trans_loss_weight * trans_loss + self.rot_loss_weight * rot_loss
-            all_losses.append(total)
-            all_trans.append(trans_loss)
-            all_rot.append(rot_loss)
-
-        return {
-            "loss": torch.stack(all_losses).mean(),
-            "trans_loss": torch.stack(all_trans).mean(),
-            "rot_loss": torch.stack(all_rot).mean(),
-        }
+        trans_loss, rot_loss = self._compute_loss(pred_frames, true_frames, mask)
+        total = self.trans_loss_weight * trans_loss + self.rot_loss_weight * rot_loss
+        return {"loss": total, "trans_loss": trans_loss, "rot_loss": rot_loss}
 
     def _compute_loss(self, pred, true, mask):
         mask_f = mask.float()
@@ -520,7 +557,7 @@ class RFDiffusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Sampling
+# Sampling (unbatched — operates on a single protein)
 # ---------------------------------------------------------------------------
 
 
@@ -536,22 +573,34 @@ def sample(
     """Generate a protein backbone via reverse diffusion."""
     network.eval()
     L = num_residues
-    frames = RigidTransform.identity((L,), device=device)
-    frames, _ = diffusion.forward_marginal(frames, torch.ones(L, device=device))
+
+    # Create frames with batch dim [1, L, ...]
+    frames = RigidTransform.identity((1, L), device=device)
+    t_init = torch.ones(1, L, device=device)
+    frames, _ = diffusion.forward_marginal(frames, t_init)
 
     prev_pred = None
     timesteps = torch.linspace(1, 0, num_steps + 1)
-    trajectory = [frames]
+    # Store unbatched trajectory for backward compat
+    trajectory = [RigidTransform(frames.rots.squeeze(0), frames.trans.squeeze(0))]
 
     for i in range(num_steps):
         t_now, t_next = timesteps[i].item(), timesteps[i + 1].item()
-        pred = network(frames, torch.tensor(t_now, device=device), prev_pred)
+        pred = network(frames, torch.tensor([t_now], device=device), prev_pred)
         if self_conditioning and torch.rand(1).item() < 0.5:
             prev_pred = pred.detach()
+
+        # Squeeze to unbatched for reverse step, then re-batch
+        pred_ub = RigidTransform(pred.rots.squeeze(0), pred.trans.squeeze(0))
+        frames_ub = RigidTransform(frames.rots.squeeze(0), frames.trans.squeeze(0))
+
         if t_next > 0:
-            frames = diffusion.reverse_step(frames, pred, t_now, t_next)
+            frames_ub = diffusion.reverse_step(frames_ub, pred_ub, t_now, t_next)
         else:
-            frames = pred
-        trajectory.append(RigidTransform(frames.rots.detach(), frames.trans.detach()))
+            frames_ub = pred_ub
+
+        trajectory.append(RigidTransform(frames_ub.rots.detach(), frames_ub.trans.detach()))
+        # Re-batch for next iteration
+        frames = RigidTransform(frames_ub.rots.unsqueeze(0), frames_ub.trans.unsqueeze(0))
 
     return trajectory

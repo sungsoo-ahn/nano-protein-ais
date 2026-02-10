@@ -31,7 +31,7 @@ target-version = "py310"
 select = ["E", "F", "I", "W"]
 
 [tool.setuptools]
-packages = ["proteinmpnn", "alphafold3", "rfdiffusion"]
+packages = ["proteinmpnn", "alphafold3", "rfdiffusion", "esm2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

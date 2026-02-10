@@ -56,7 +56,13 @@ def tokenize_sequence(sequence: str) -> list[int]:
 class FASTADataset(Dataset):
     """Dataset of protein sequences from a FASTA file."""
 
-    def __init__(self, fasta_path: str | Path, max_length: int = MAX_SEQ_LEN, min_length: int = 20):
+    def __init__(
+        self,
+        fasta_path: str | Path,
+        max_length: int = MAX_SEQ_LEN,
+        min_length: int = 20,
+        max_samples: int | None = None,
+    ):
         self.max_tokens = max_length + 2  # CLS + seq + EOS
         self.sequences: list[torch.Tensor] = []
 
@@ -82,6 +88,9 @@ class FASTADataset(Dataset):
                 seq = "".join(current_seq)
                 if min_length <= len(seq) <= max_length:
                     self.sequences.append(torch.tensor(tokenize_sequence(seq), dtype=torch.long))
+
+        if max_samples:
+            self.sequences = self.sequences[:max_samples]
 
         logger.info(f"Loaded {len(self.sequences)} sequences from {path}")
 
@@ -119,7 +128,7 @@ def train(data_path: str, output_dir: str = "outputs/esm2") -> None:
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         pin_memory=device.type == "cuda",
     )
 
