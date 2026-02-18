@@ -1,20 +1,21 @@
 """Training script for RFDiffusion backbone generation model.
 
 Self-contained: includes PDB parser + dataset + training loop.
+Automatically downloads PDB files if data directory is empty.
 
 Usage:
-    python -m rfdiffusion.train [--data_dir path/to/pdbs]
+    python train.py [--data_dir data/pdb]
 """
 
 import argparse
 import logging
 import math
+import urllib.request
 from pathlib import Path
 
 import torch
+from model import RFDiffusion
 from torch.utils.data import DataLoader, Dataset
-
-from rfdiffusion.model import RFDiffusion
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -108,6 +109,26 @@ def parse_pdb(pdb_path: Path) -> dict[str, torch.Tensor] | None:
         "sequence": torch.tensor(seq_idx, dtype=torch.long),
         "mask": torch.ones(L, dtype=torch.bool),
     }
+
+
+# ---------------------------------------------------------------------------
+# Data download
+# ---------------------------------------------------------------------------
+
+PDB_IDS = ["1CRN", "1UBQ", "2GB1", "1L2Y", "1VII", "1ENH", "1BDD", "1PRB"]
+
+
+def download_pdb_data(data_dir: str = "data/pdb") -> Path:
+    """Download small PDB files from RCSB for training."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for pdb_id in PDB_IDS:
+        path = data_dir / f"{pdb_id}.pdb"
+        if not path.exists():
+            url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+            logger.info(f"Downloading {pdb_id}.pdb from RCSB...")
+            urllib.request.urlretrieve(url, path)
+    return data_dir
 
 
 # ---------------------------------------------------------------------------
@@ -235,4 +256,5 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", default="data/pdb")
     parser.add_argument("--output_dir", default="outputs/rfdiffusion")
     args = parser.parse_args()
+    download_pdb_data(args.data_dir)
     train(args.data_dir, args.output_dir)

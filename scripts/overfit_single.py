@@ -1,7 +1,7 @@
-"""Overfit AF3 or RFDiffusion on a single protein (1CRN) for 50K steps.
+"""Overfit AF2 or RFDiffusion on a single protein (1CRN) for 50K steps.
 
 Usage:
-    python scripts/overfit_single.py --model alphafold3  --gpu 1 --steps 50000 &
+    python scripts/overfit_single.py --model alphafold2  --gpu 1 --steps 50000 &
     python scripts/overfit_single.py --model rfdiffusion --gpu 2 --steps 50000 &
 """
 
@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", required=True, choices=["alphafold3", "rfdiffusion"])
+parser.add_argument("--model", required=True, choices=["alphafold2", "rfdiffusion"])
 parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument("--steps", type=int, default=50000)
 parser.add_argument("--pdb", default="1CRN.pdb")
@@ -45,8 +45,8 @@ EVAL_EVERY = 5000
 
 
 def load_protein(pdb_path: Path) -> dict:
-    if args.model == "alphafold3":
-        from alphafold3.train import parse_pdb
+    if args.model == "alphafold2":
+        from alphafold2.train import parse_pdb
     else:
         from rfdiffusion.train import parse_pdb
     protein = parse_pdb(pdb_path)
@@ -64,13 +64,13 @@ def make_batch(protein: dict, device: torch.device) -> dict:
     return {k: v.unsqueeze(0).to(device) for k, v in protein.items()}
 
 
-def eval_af3(model, protein, device):
+def eval_af2(model, protein, device):
     seq = protein["sequence"].to(device)
     true_ca = protein["coords_CA"]
     L = true_ca.shape[0]
     with torch.no_grad():
         pred = model.predict(seq)
-    pred_ca = pred["coords"].cpu()[:L]
+    pred_ca = pred["coords_CA"].cpu()[:L]
     pred_ca = pred_ca - pred_ca.mean(dim=0, keepdim=True)
     true_centered = true_ca - true_ca.mean(dim=0, keepdim=True)
     rmsd = ((pred_ca - true_centered) ** 2).sum(dim=-1).mean().sqrt().item()
@@ -118,10 +118,10 @@ def eval_rfd(model, device, num_residues, protein=None):
         logger.info(f"  EVAL denoise: CA-RMSD={rmsd:.2f}A (from t=0.05)")
 
 
-def train_alphafold3(protein, device):
-    from alphafold3.model import AlphaFold3
+def train_alphafold2(protein, device):
+    from alphafold2.model import AlphaFold2
 
-    model = AlphaFold3(distogram_weight=0.0, plddt_weight=0.0, sigma_data=7.0).to(device)
+    model = AlphaFold2(plddt_weight=0.0).to(device)
     logger.info(f"Parameters: {model.count_parameters():,}")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
@@ -129,7 +129,6 @@ def train_alphafold3(protein, device):
         logger.info(f"Resumed from {args.resume}")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     batch = make_batch(protein, device)
-    L = protein["coords_CA"].shape[0]
 
     for step in range(1, args.steps + 1):
         model.train()
@@ -143,15 +142,17 @@ def train_alphafold3(protein, device):
         if step % LOG_EVERY == 0:
             logger.info(
                 f"step={step} loss={loss.item():.4f} "
-                f"diffusion_loss={outputs['diffusion_loss'].item():.4f}"
+                f"fape={outputs['fape_loss'].item():.3f} "
+                f"trans={outputs['trans_loss'].item():.3f} "
+                f"rot={outputs['rot_loss'].item():.3f}"
             )
         if step % EVAL_EVERY == 0:
-            eval_af3(model, protein, device)
+            eval_af2(model, protein, device)
 
     torch.save({"model_state_dict": model.state_dict()}, out_dir / "final_model.pt")
     logger.info(f"Saved checkpoint to {out_dir / 'final_model.pt'}")
     logger.info("Final evaluation:")
-    eval_af3(model, protein, device)
+    eval_af2(model, protein, device)
 
 
 def train_rfdiffusion(protein, device):
@@ -203,8 +204,8 @@ if __name__ == "__main__":
     L = protein["coords_CA"].shape[0]
     logger.info(f"Protein: {args.pdb} (L={L}), {args.steps} steps, LR={LR}, resume={args.resume}")
 
-    if args.model == "alphafold3":
-        train_alphafold3(protein, device)
+    if args.model == "alphafold2":
+        train_alphafold2(protein, device)
     else:
         train_rfdiffusion(protein, device)
     logger.info("DONE.")

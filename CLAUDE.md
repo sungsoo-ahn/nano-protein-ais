@@ -8,7 +8,7 @@ Minimal, self-contained implementations of three protein AI models, inspired by 
 
 ### The Three Models
 
-- **alphafold3/** — Structure prediction: amino acid sequence → 3D backbone coordinates. Core ideas: Pairformer (single+pair representation, no MSA), coordinate diffusion with EDM/Karras preconditioning.
+- **alphafold2/** — Structure prediction: amino acid sequence → 3D backbone frames. Core ideas: Pairformer (single+pair representation, no MSA), SE(3) frame diffusion with product SO(3)×R(3) noise schedules, FAPE loss.
 - **rfdiffusion/** — De novo backbone generation via SE(3) diffusion. Core ideas: SO(3)+R(3) noise schedules, denoising network with IPA, self-conditioning.
 - **proteinmpnn/** — Inverse folding: backbone structure → amino acid sequence. Core ideas: k-NN graph on CA atoms, MPNN encoder, autoregressive decoder.
 
@@ -35,7 +35,7 @@ pytest tests/ -k "test_forward" -v    # single test by name
 - **Each model = `model.py` + `train.py`.** `model.py` has the full architecture. `train.py` is a runnable script. Additional files only when a module (e.g., evoformer, diffusion) is genuinely large enough to warrant separation.
 - **No configuration objects.** Use simple constants or dataclass defaults at the top of each file. A student should see the hyperparameters right where they're used.
 - **Readable over reusable.** Code is meant to be forked and modified, not imported as a library. Optimize for someone reading top-to-bottom.
-- **Small parameter counts.** Models should train on a single GPU in hours (AlphaFold3 ~30M, RFDiffusion ~35M, ProteinMPNN ~3.5M).
+- **Small parameter counts.** Models should train on a single GPU in hours (AlphaFold2 ~30M, RFDiffusion ~35M, ProteinMPNN ~3.5M).
 
 ## Key Protein AI Concepts Used Across Models
 
@@ -53,12 +53,12 @@ proteinmpnn/
                            # ProteinMPNN with forward() + design()
   train.py    (231 lines)  # PDB parser + dataset + training loop
 
-alphafold3/
+alphafold2/
   model.py    (~650 lines) # Geometry + RigidTransform, Pairformer (single attn w/
-                           # pair bias, triangular updates/attention), EDM noise
-                           # schedule, diffusion transformer, DiffusionModule,
-                           # heads (distogram, pLDDT), losses (diffusion, distogram,
-                           # pLDDT), AlphaFold3 with forward() + predict()
+                           # pair bias, triangular updates/attention), SE(3) diffusion
+                           # (IGSO3 + cosine DDPM), diffusion transformer, DiffusionModule,
+                           # heads (pLDDT), losses (FAPE, pLDDT),
+                           # AlphaFold2 with forward() + predict()
   train.py    (227 lines)  # PDB parser + dataset + training loop
 
 rfdiffusion/
@@ -71,7 +71,7 @@ rfdiffusion/
 tests/
   conftest.py         (47 lines)   # Shared fixtures
   test_proteinmpnn.py (145 lines)  # 10 tests
-  test_alphafold3.py  (~160 lines) # 11 tests
+  test_alphafold2.py  (~160 lines) # 12 tests
   test_rfdiffusion.py (152 lines)  # 10 tests
 ```
 

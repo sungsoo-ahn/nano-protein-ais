@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/train_and_eval.py --model proteinmpnn --gpu 0
-    python scripts/train_and_eval.py --model alphafold3  --gpu 1
+    python scripts/train_and_eval.py --model alphafold2  --gpu 1
     python scripts/train_and_eval.py --model rfdiffusion --gpu 2
     python scripts/train_and_eval.py --model esm2        --gpu 3
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 # Must set CUDA_VISIBLE_DEVICES before importing torch
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--model", required=True, choices=["proteinmpnn", "alphafold3", "rfdiffusion", "esm2"]
+    "--model", required=True, choices=["proteinmpnn", "alphafold2", "rfdiffusion", "esm2"]
 )
 parser.add_argument("--gpu", type=int, default=0)
 args = parser.parse_args()
@@ -153,11 +153,11 @@ def train_proteinmpnn():
 
 
 # ===========================================================================
-# AlphaFold3 — Overfit config
+# AlphaFold2 — Overfit config
 # ===========================================================================
-def train_alphafold3():
-    from alphafold3.model import AlphaFold3
-    from alphafold3.train import PDBDataset, collate_fn
+def train_alphafold2():
+    from alphafold2.model import AlphaFold2
+    from alphafold2.train import PDBDataset, collate_fn
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -174,8 +174,8 @@ def train_alphafold3():
     logger.info(f"Dataset: {len(dataset)} samples, batch_size={BATCH_SIZE}")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
-    # Focus on diffusion loss only; sigma_data=7 matches centered data std; no weight decay
-    model = AlphaFold3(distogram_weight=0.0, plddt_weight=0.0, sigma_data=7.0).to(device)
+    # No weight decay for overfitting
+    model = AlphaFold2(plddt_weight=0.0).to(device)
     logger.info(f"Parameters: {model.count_parameters():,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)  # Adam w/o weight decay
@@ -210,7 +210,9 @@ def train_alphafold3():
             logger.info(
                 f"epoch={epoch + 1} step={global_step} "
                 f"loss={loss.item():.4f} "
-                f"diffusion_loss={outputs['diffusion_loss'].item():.4f}"
+                f"fape={outputs['fape_loss'].item():.3f} "
+                f"trans={outputs['trans_loss'].item():.3f} "
+                f"rot={outputs['rot_loss'].item():.3f}"
             )
 
     ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
@@ -222,7 +224,7 @@ def train_alphafold3():
     logger.info("EVALUATION: Structure Prediction")
     logger.info("=" * 60)
 
-    from alphafold3.train import parse_pdb
+    from alphafold2.train import parse_pdb
 
     eval_pdbs = ["1CRN.pdb", "1UBQ.pdb", "2GB1.pdb"]
     for pdb_name in eval_pdbs:
@@ -243,7 +245,7 @@ def train_alphafold3():
         with torch.no_grad():
             pred = model.predict(seq)
 
-        pred_ca = pred["coords"].cpu()[:L_real]
+        pred_ca = pred["coords_CA"].cpu()[:L_real]
         true_ca = true_ca[:L_real]
         plddt = pred["plddt"].cpu()[:L_real]
 
@@ -255,7 +257,7 @@ def train_alphafold3():
             f"  {pdb_name} (L={L_real}): CA-RMSD={rmsd:.2f}A  mean_pLDDT={plddt.mean().item():.3f}"
         )
 
-    logger.info("AlphaFold3 evaluation complete.")
+    logger.info("AlphaFold2 evaluation complete.")
 
 
 # ===========================================================================
@@ -476,7 +478,7 @@ if __name__ == "__main__":
 
     dispatch = {
         "proteinmpnn": train_proteinmpnn,
-        "alphafold3": train_alphafold3,
+        "alphafold2": train_alphafold2,
         "rfdiffusion": train_rfdiffusion,
         "esm2": train_esm2,
     }

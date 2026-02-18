@@ -1,7 +1,7 @@
 [project]
 name = "nano-protein-ais"
 version = "0.1.0"
-description = "Minimal, readable implementations of AlphaFold3, RFDiffusion, and ProteinMPNN"
+description = "Minimal, readable implementations of AlphaFold2, RFDiffusion, and ProteinMPNN"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1.0",
@@ -31,7 +31,7 @@ target-version = "py310"
 select = ["E", "F", "I", "W"]
 
 [tool.setuptools]
-packages = ["proteinmpnn", "alphafold3", "rfdiffusion", "esm2"]
+packages = ["proteinmpnn", "alphafold2", "rfdiffusion", "esm2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

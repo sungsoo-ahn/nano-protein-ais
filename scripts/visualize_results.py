@@ -1,4 +1,4 @@
-"""Visualize AlphaFold3 predictions and RFDiffusion samples with PyMOL.
+"""Visualize AlphaFold2 predictions and RFDiffusion samples with PyMOL.
 
 Loads trained checkpoints, runs inference, writes CA-only PDB files,
 generates a PyMOL render script, and executes it.
@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Must set CUDA_VISIBLE_DEVICES before importing torch
-parser = argparse.ArgumentParser(description="Visualize AF3 and RFDiffusion results")
+parser = argparse.ArgumentParser(description="Visualize AF2 and RFDiffusion results")
 parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument("--no-render", action="store_true", help="Generate PDBs and script only")
 args = parser.parse_args()
@@ -58,23 +58,23 @@ def write_ca_pdb(path: Path, ca_coords: torch.Tensor, sequence: torch.Tensor | N
 # Step 1 & 2: Generate structures and write PDBs
 # ---------------------------------------------------------------------------
 
-def generate_af3_structures():
-    """Load AF3 checkpoint, predict structures for eval proteins."""
-    from alphafold3.model import AlphaFold3
-    from alphafold3.train import parse_pdb
+def generate_af2_structures():
+    """Load AF2 checkpoint, predict structures for eval proteins."""
+    from alphafold2.model import AlphaFold2
+    from alphafold2.train import parse_pdb
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Try single-protein overfit checkpoint first, then fall back to multi-protein
-    ckpt_path = ROOT / "outputs" / "alphafold3_single" / "final_model.pt"
+    ckpt_path = ROOT / "outputs" / "alphafold2_single" / "final_model.pt"
     if not ckpt_path.exists():
-        ckpt_path = ROOT / "outputs" / "alphafold3" / "final_model.pt"
+        ckpt_path = ROOT / "outputs" / "alphafold2" / "final_model.pt"
     if not ckpt_path.exists():
-        print(f"AF3 checkpoint not found")
+        print("AF2 checkpoint not found")
         return []
-    print(f"  Loading AF3 from {ckpt_path}")
+    print(f"  Loading AF2 from {ckpt_path}")
 
-    # Must match training config: sigma_data=7.0, zero aux weights
-    model = AlphaFold3(distogram_weight=0.0, plddt_weight=0.0, sigma_data=7.0).to(device)
+    # Must match training config: zero aux weights
+    model = AlphaFold2(plddt_weight=0.0).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -99,15 +99,15 @@ def generate_af3_structures():
         with torch.no_grad():
             pred = model.predict(seq)
 
-        pred_ca = pred["coords"].cpu()[:L_real]
+        pred_ca = pred["coords_CA"].cpu()[:L_real]
         true_ca = true_ca[:L_real]
 
         # Write predicted CA PDB
-        pred_path = VIS_DIR / f"af3_pred_{name}.pdb"
+        pred_path = VIS_DIR / f"af2_pred_{name}.pdb"
         write_ca_pdb(pred_path, pred_ca, protein["sequence"][:L_real])
 
         # Copy native PDB for overlay
-        native_dst = VIS_DIR / f"af3_native_{name}.pdb"
+        native_dst = VIS_DIR / f"af2_native_{name}.pdb"
         shutil.copy2(pdb_path, native_dst)
 
         # Compute RMSD (centered) for labeling
@@ -115,7 +115,7 @@ def generate_af3_structures():
         true_center = true_ca - true_ca.mean(dim=0, keepdim=True)
         rmsd = ((pred_center - true_center) ** 2).sum(dim=-1).mean().sqrt().item()
 
-        print(f"  AF3 {name}: L={L_real}, CA-RMSD={rmsd:.2f}A")
+        print(f"  AF2 {name}: L={L_real}, CA-RMSD={rmsd:.2f}A")
         results.append((name, rmsd))
 
     return results
@@ -201,7 +201,7 @@ def generate_rfd_structures():
 # Step 3: Generate PyMOL render script
 # ---------------------------------------------------------------------------
 
-def write_render_script(af3_results: list, rfd_lengths: list):
+def write_render_script(af2_results: list, rfd_lengths: list):
     """Generate PyMOL render script for all structures."""
     script_path = VIS_DIR / "render.py"
     vis_abs = str(VIS_DIR.resolve())
@@ -224,13 +224,13 @@ def write_render_script(af3_results: list, rfd_lengths: list):
         "",
     ]
 
-    # AF3 renders: predicted vs native overlay
-    for name, rmsd in af3_results:
-        pred_pdb = os.path.join(vis_abs, f"af3_pred_{name}.pdb")
-        native_pdb = os.path.join(vis_abs, f"af3_native_{name}.pdb")
-        png_path = os.path.join(vis_abs, f"af3_{name}.png")
+    # AF2 renders: predicted vs native overlay
+    for name, rmsd in af2_results:
+        pred_pdb = os.path.join(vis_abs, f"af2_pred_{name}.pdb")
+        native_pdb = os.path.join(vis_abs, f"af2_native_{name}.pdb")
+        png_path = os.path.join(vis_abs, f"af2_{name}.png")
         lines += [
-            f"# --- AF3: {name} (RMSD={rmsd:.1f}A) ---",
+            f"# --- AF2: {name} (RMSD={rmsd:.1f}A) ---",
             f"cmd.load({pred_pdb!r}, 'pred')",
             f"cmd.load({native_pdb!r}, 'native')",
             "",
@@ -384,20 +384,20 @@ def main():
     print("Step 1-2: Generate structures and write PDBs")
     print("=" * 60)
 
-    print("\nAlphaFold3 predictions:")
-    af3_results = generate_af3_structures()
+    print("\nAlphaFold2 predictions:")
+    af2_results = generate_af2_structures()
 
     print("\nRFDiffusion samples:")
     rfd_lengths = generate_rfd_structures()
 
-    if not af3_results and not rfd_lengths:
+    if not af2_results and not rfd_lengths:
         print("No structures generated. Check checkpoints exist.")
         return
 
     print("\n" + "=" * 60)
     print("Step 3: Generate PyMOL render script")
     print("=" * 60)
-    script_path = write_render_script(af3_results, rfd_lengths)
+    script_path = write_render_script(af2_results, rfd_lengths)
     print(f"Render script: {script_path}")
 
     if args.no_render:

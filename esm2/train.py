@@ -4,7 +4,12 @@ Trains ESM2 from scratch on protein sequences in FASTA format.
 Self-contained: includes FASTA dataset loader + training loop.
 
 Usage:
-    python -m esm2.train [--data_path path/to/seqs.fasta]
+    python train.py [--data_path path/to/seqs.fasta]
+
+Data:
+    Any FASTA file with protein sequences works. To get Swiss-Prot:
+    wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+    gunzip uniprot_sprot.fasta.gz
 """
 
 import argparse
@@ -13,9 +18,7 @@ import math
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-
-from esm2.model import (
+from model import (
     AA_TO_IDX,
     CLS_IDX,
     EOS_IDX,
@@ -25,6 +28,7 @@ from esm2.model import (
     compute_mlm_loss,
     mask_tokens,
 )
+from torch.utils.data import DataLoader, Dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
