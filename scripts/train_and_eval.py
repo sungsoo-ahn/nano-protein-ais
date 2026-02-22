@@ -16,7 +16,12 @@ from pathlib import Path
 # Must set CUDA_VISIBLE_DEVICES before importing torch
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--model", required=True, choices=["proteinmpnn", "alphafold2", "rfdiffusion", "esm2"]
+    "--model",
+    required=True,
+    choices=[
+        "proteinmpnn", "alphafold2", "rfdiffusion", "esm2",
+        "polymer_vae", "polymer_diffusion",
+    ],
 )
 parser.add_argument("--gpu", type=int, default=0)
 args = parser.parse_args()
@@ -24,6 +29,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
 import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
+
+# Create output directory before setting up file handler
+Path(f"outputs/{args.model}").mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,9 +43,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Ensure project root is on path
+# Ensure project root and the target model directory are on path
+# (each train.py uses bare `from model import ...` for standalone use)
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / args.model))
 
 SEED = 42
 DATA_DIR = ROOT / "data"
@@ -153,20 +163,54 @@ def train_proteinmpnn():
 
 
 # ===========================================================================
+# Kabsch alignment (SVD-based optimal superposition)
+# ===========================================================================
+def kabsch_rmsd(pred: torch.Tensor, true: torch.Tensor) -> float:
+    """Compute RMSD after optimal rigid-body alignment (Kabsch algorithm).
+
+    Args:
+        pred: [L, 3] predicted coordinates
+        true: [L, 3] true coordinates
+    Returns:
+        RMSD in Angstroms (float)
+    """
+    # Center both
+    pred_c = pred - pred.mean(dim=0, keepdim=True)
+    true_c = true - true.mean(dim=0, keepdim=True)
+    # Covariance matrix
+    H = pred_c.T @ true_c  # [3, 3]
+    U, S, Vt = torch.linalg.svd(H)
+    # Correct for reflection
+    d = torch.det(Vt.T @ U.T)
+    sign = torch.diag(torch.tensor([1.0, 1.0, d.sign()], device=pred.device))
+    R = Vt.T @ sign @ U.T
+    pred_aligned = pred_c @ R.T
+    return ((pred_aligned - true_c) ** 2).sum(dim=-1).mean().sqrt().item()
+
+
+# ===========================================================================
 # AlphaFold2 — Overfit config
 # ===========================================================================
 def train_alphafold2():
-    from alphafold2.model import AlphaFold2
+    import math
+
+    import alphafold2.model as af2_model
+    from alphafold2.model import AlphaFold2, SE3Diffusion
     from alphafold2.train import PDBDataset, collate_fn
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    NUM_EPOCHS = 10000
-    LR = 5e-3
+    # Reduce SO(3) noise for easier rotation denoising; more sampling steps
+    ROT_SIGMA = 0.8
+    af2_model.NUM_SAMPLE_STEPS = 200
+    logger.info(f"rot_sigma_max={ROT_SIGMA}, NUM_SAMPLE_STEPS={af2_model.NUM_SAMPLE_STEPS}")
+
+    NUM_EPOCHS = 20000
+    LR = 3e-3
     GRAD_CLIP = 1.0
-    WARMUP_STEPS = 50
-    LOG_EVERY = 50
+    WARMUP_STEPS = 100
+    LOG_EVERY = 100
 
     # max_length=80 fits all 9 proteins (longest is L=76) — reduces O(L^3) tri-attn drastically
     dataset = PDBDataset(PDB_DIR, max_length=80)
@@ -174,16 +218,20 @@ def train_alphafold2():
     logger.info(f"Dataset: {len(dataset)} samples, batch_size={BATCH_SIZE}")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
-    # No weight decay for overfitting
     model = AlphaFold2(plddt_weight=0.0).to(device)
+    # Replace diffusion with reduced SO(3) noise
+    model.diffusion = SE3Diffusion(rot_sigma_max=ROT_SIGMA)
     logger.info(f"Parameters: {model.count_parameters():,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)  # Adam w/o weight decay
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    total_steps = NUM_EPOCHS  # 1 batch per epoch
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return step / max(1, WARMUP_STEPS)
-        return 1.0
+        # Cosine decay to 1% of peak
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -212,7 +260,8 @@ def train_alphafold2():
                 f"loss={loss.item():.4f} "
                 f"fape={outputs['fape_loss'].item():.3f} "
                 f"trans={outputs['trans_loss'].item():.3f} "
-                f"rot={outputs['rot_loss'].item():.3f}"
+                f"rot={outputs['rot_loss'].item():.3f} "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
     ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
@@ -227,6 +276,7 @@ def train_alphafold2():
     from alphafold2.train import parse_pdb
 
     eval_pdbs = ["1CRN.pdb", "1UBQ.pdb", "2GB1.pdb"]
+    NUM_SAMPLES = 5  # multiple predictions per protein (diffusion is stochastic)
     for pdb_name in eval_pdbs:
         pdb_path = PDB_DIR / pdb_name
         if not pdb_path.exists():
@@ -242,19 +292,18 @@ def train_alphafold2():
         mask = protein["mask"]
         L_real = mask.sum().item()
 
-        with torch.no_grad():
-            pred = model.predict(seq)
+        rmsds = []
+        for _ in range(NUM_SAMPLES):
+            with torch.no_grad():
+                pred = model.predict(seq)
+            pred_ca = pred["coords_CA"].cpu()[:L_real]
+            rmsds.append(kabsch_rmsd(pred_ca, true_ca[:L_real]))
 
-        pred_ca = pred["coords_CA"].cpu()[:L_real]
-        true_ca = true_ca[:L_real]
-        plddt = pred["plddt"].cpu()[:L_real]
-
-        pred_center = pred_ca - pred_ca.mean(dim=0, keepdim=True)
-        true_center = true_ca - true_ca.mean(dim=0, keepdim=True)
-        rmsd = ((pred_center - true_center) ** 2).sum(dim=-1).mean().sqrt().item()
-
+        best = min(rmsds)
+        mean = sum(rmsds) / len(rmsds)
         logger.info(
-            f"  {pdb_name} (L={L_real}): CA-RMSD={rmsd:.2f}A  mean_pLDDT={plddt.mean().item():.3f}"
+            f"  {pdb_name} (L={L_real}): best={best:.2f}A  mean={mean:.2f}A  "
+            f"(over {NUM_SAMPLES} samples)"
         )
 
     logger.info("AlphaFold2 evaluation complete.")
@@ -264,18 +313,20 @@ def train_alphafold2():
 # RFDiffusion — Overfit config
 # ===========================================================================
 def train_rfdiffusion():
+    import math
+
     from rfdiffusion.model import RFDiffusion, sample
     from rfdiffusion.train import PDBDataset, collate_fn
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    NUM_EPOCHS = 10000
+    NUM_EPOCHS = 20000
     BATCH_SIZE = 9  # full batch (9 PDBs), random timesteps provide noise each step
     LR = 5e-4
     GRAD_CLIP = 1.0
-    WARMUP_STEPS = 100
-    LOG_EVERY = 50
+    WARMUP_STEPS = 200
+    LOG_EVERY = 100
 
     # max_length=80 fits all 9 proteins (longest is L=76) — reduces padding waste
     dataset = PDBDataset(PDB_DIR, max_length=80)
@@ -285,12 +336,15 @@ def train_rfdiffusion():
     model = RFDiffusion().to(device)  # default: 8 blocks, 256 node, 64 pair
     logger.info(f"Parameters: {model.count_parameters():,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)  # Adam w/o weight decay
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    total_steps = NUM_EPOCHS  # 1 batch per epoch
 
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return step / max(1, WARMUP_STEPS)
-        return 1.0
+        # Cosine decay to 1% of peak
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -326,7 +380,8 @@ def train_rfdiffusion():
             logger.info(
                 f"epoch={epoch + 1} step={global_step} "
                 f"loss={epoch_loss / n_batches:.4f} "
-                f"trans={epoch_trans / n_batches:.3f} rot={epoch_rot / n_batches:.3f}"
+                f"trans={epoch_trans / n_batches:.3f} rot={epoch_rot / n_batches:.3f} "
+                f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
     ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
@@ -345,7 +400,7 @@ def train_rfdiffusion():
                 network=model.network,
                 diffusion=model.diffusion,
                 num_residues=length,
-                num_steps=100,
+                num_steps=200,
                 device=device,
             )
 
@@ -463,6 +518,157 @@ def train_esm2():
 
 
 # ===========================================================================
+# Polymer VAE
+# ===========================================================================
+def train_polymer_vae():
+    from polymer_vae.model import PolymerVAE, radius_of_gyration
+    from polymer_vae.train import PolymerDataset, download_polymer_data
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+
+    NUM_EPOCHS = 150
+    BATCH_SIZE = 256
+    LR = 1e-3
+
+    data_path = download_polymer_data(DATA_DIR / "polymer")
+    train_dataset = PolymerDataset(data_path, train=True)
+    test_dataset = PolymerDataset(data_path, train=False)
+    logger.info(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    model = PolymerVAE().to(device)
+    logger.info(f"Parameters: {model.count_parameters():,}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(batch)
+            loss = outputs["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        if epoch % 25 == 0 or epoch == 1:
+            model.eval()
+            test_loss = 0.0
+            n_test = 0
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    out = model(batch)
+                    test_loss += out["loss"].item()
+                    n_test += 1
+            logger.info(
+                f"epoch={epoch} train_loss={epoch_loss / n_batches:.4f} "
+                f"test_loss={test_loss / n_test:.4f} "
+                f"recon={out['recon_loss'].item():.4f} kl={out['kl_loss'].item():.4f}"
+            )
+
+    ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
+    torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+    logger.info(f"Saved checkpoint to {ckpt_path}")
+
+    # --- Evaluation: Rg distribution ---
+    logger.info("=" * 60)
+    logger.info("EVALUATION: Rg Distribution Comparison")
+    logger.info("=" * 60)
+    model.eval()
+    samples = model.sample(1000, device=device)
+    sample_rg = radius_of_gyration(samples).cpu()
+    test_coords = test_dataset.coords.view(-1, 12, 2)
+    data_rg = radius_of_gyration(test_coords)
+    logger.info(
+        f"Rg — data: mean={data_rg.mean():.3f} std={data_rg.std():.3f} | "
+        f"samples: mean={sample_rg.mean():.3f} std={sample_rg.std():.3f}"
+    )
+    logger.info("Polymer VAE evaluation complete.")
+
+
+# ===========================================================================
+# Polymer Diffusion
+# ===========================================================================
+def train_polymer_diffusion():
+    from polymer_diffusion.model import PolymerDiffusion, radius_of_gyration
+    from polymer_diffusion.train import PolymerDataset, download_polymer_data
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+
+    NUM_EPOCHS = 200
+    BATCH_SIZE = 256
+    LR = 1e-3
+
+    data_path = download_polymer_data(DATA_DIR / "polymer")
+    train_dataset = PolymerDataset(data_path, train=True)
+    test_dataset = PolymerDataset(data_path, train=False)
+    logger.info(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    model = PolymerDiffusion().to(device)
+    logger.info(f"Parameters: {model.count_parameters():,}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(batch)
+            loss = outputs["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        if epoch % 40 == 0 or epoch == 1:
+            model.eval()
+            test_loss = 0.0
+            n_test = 0
+            with torch.no_grad():
+                for batch in test_loader:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    out = model(batch)
+                    test_loss += out["loss"].item()
+                    n_test += 1
+            logger.info(
+                f"epoch={epoch} train_loss={epoch_loss / n_batches:.4f} "
+                f"test_loss={test_loss / n_test:.4f}"
+            )
+
+    ckpt_path = Path(f"outputs/{args.model}/final_model.pt")
+    torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+    logger.info(f"Saved checkpoint to {ckpt_path}")
+
+    # --- Evaluation: Rg distribution ---
+    logger.info("=" * 60)
+    logger.info("EVALUATION: Rg Distribution Comparison")
+    logger.info("=" * 60)
+    model.eval()
+    samples = model.sample(1000, device=device)
+    sample_rg = radius_of_gyration(samples).cpu()
+    test_coords = test_dataset.coords.view(-1, 12, 2)
+    data_rg = radius_of_gyration(test_coords)
+    logger.info(
+        f"Rg — data: mean={data_rg.mean():.3f} std={data_rg.std():.3f} | "
+        f"samples: mean={sample_rg.mean():.3f} std={sample_rg.std():.3f}"
+    )
+    logger.info("Polymer Diffusion evaluation complete.")
+
+
+# ===========================================================================
 # Main dispatch
 # ===========================================================================
 if __name__ == "__main__":
@@ -481,6 +687,8 @@ if __name__ == "__main__":
         "alphafold2": train_alphafold2,
         "rfdiffusion": train_rfdiffusion,
         "esm2": train_esm2,
+        "polymer_vae": train_polymer_vae,
+        "polymer_diffusion": train_polymer_diffusion,
     }
     dispatch[args.model]()
     logger.info("DONE.")
