@@ -28,7 +28,7 @@ BATCH_SIZE = 256
 LEARNING_RATE = 1e-3
 NUM_EPOCHS = 200
 
-DATA_URL = "https://dmol.pub/_static/long_paths.npz"
+DATA_URL = "https://github.com/whitead/dmol-book/raw/main/data/long_paths.npz"
 
 
 # ---------------------------------------------------------------------------

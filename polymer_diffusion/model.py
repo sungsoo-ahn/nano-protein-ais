@@ -51,8 +51,9 @@ class NoiseSchedule:
         Returns:
             x_t: [B, D] noised data
         """
-        sqrt_ab = self.sqrt_alpha_bars[t].unsqueeze(-1).to(x0.device)
-        sqrt_omab = self.sqrt_one_minus_alpha_bars[t].unsqueeze(-1).to(x0.device)
+        t_cpu = t.cpu()
+        sqrt_ab = self.sqrt_alpha_bars[t_cpu].unsqueeze(-1).to(x0.device)
+        sqrt_omab = self.sqrt_one_minus_alpha_bars[t_cpu].unsqueeze(-1).to(x0.device)
         return sqrt_ab * x0 + sqrt_omab * noise
 
 
